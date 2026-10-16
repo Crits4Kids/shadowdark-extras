@@ -362,7 +362,7 @@ export async function refreshSceneAuras() {
  * Get all active aura effects on the scene
  * @returns {Array} Array of {effect, token, config} objects
  */
-export function getActiveAuras() {
+export function getActiveAuras({ includeInactive = false } = {}) {
     const auras = [];
 
     for (const token of canvas.tokens.placeables) {
@@ -372,6 +372,8 @@ export function getActiveAuras() {
         const effects = token.actor.effects || [];
         for (const effect of effects) {
             const auraConfig = effect.flags?.[MODULE_ID]?.aura;
+            // Disabled, suppressed or (v14) expired effects are inactive and must not apply
+            if (!includeInactive && effect.active === false) continue;
             if (auraConfig?.enabled) {
                 auras.push({
                     effect: effect,
@@ -678,31 +680,46 @@ function isTokenInAuraAtPosition(sourceToken, position, radiusFeet) {
  * @param {Combat} combat - The combat instance
  * @param {Object} changes - The changes object from updateCombat
  */
+/**
+ * Has a round-limited aura run out?
+ * v14 stores the limit as duration.{value, units} + start.round, and core flags it as
+ * duration.expired. The legacy duration.{startRound, rounds} reads are undefined on
+ * live v14 documents, so they are only a v13 fallback.
+ * @param {ActiveEffect} effect
+ * @param {Combat} combat
+ * @returns {boolean}
+ */
+function _isAuraExpired(effect, combat) {
+    const duration = effect.duration ?? {};
+    if (duration.expired === true) return true;
+
+    let startRound = effect.start?.round;
+    let rounds = duration.units === "rounds" ? duration.value : null;
+    if (startRound == null || rounds == null) {
+        startRound = duration.startRound;
+        rounds = duration.rounds;
+    }
+    if (typeof startRound !== "number" || typeof rounds !== "number") return false;
+
+    // Same rule as before v14: expires at the start of round startRound + rounds
+    return combat.round >= startRound + rounds;
+}
+
 async function processAuraTurnEffects(combat, changes) {
     const combatant = combat.combatant;
     console.log(`shadowdark-extras | processAuraTurnEffects: Called for ${combatant?.name}, round=${combat.round}, turn=${combat.turn}, prev=${combat.previous?.combatantId}`);
 
-    const auras = getActiveAuras();
-    if (auras.length === 0) return;
-
-    // Check for expired auras and delete them
+    // Check for expired auras and delete them (deleteActiveEffect strips their effects from tokens).
+    // Include inactive auras: v14 core marks an expired AE inactive before we get here.
     // Only GM should do this to avoid race conditions
     if (game.user.isGM) {
-        for (const { effect } of auras) {
-            const startRound = effect.duration?.startRound;
-            const rounds = effect.duration?.rounds;
-
-            if (startRound !== undefined && rounds !== undefined && rounds !== null) {
-                const currentRound = combat.round;
-                const expiryRound = startRound + rounds;
-
-                if (currentRound >= expiryRound) {
-                    await effect.delete();
-                    continue;
-                }
-            }
+        for (const { effect } of getActiveAuras({ includeInactive: true })) {
+            if (_isAuraExpired(effect, combat)) await effect.delete();
         }
     }
+
+    const auras = getActiveAuras();
+    if (auras.length === 0) return;
 
     // Process turnEnd for previous combatant FIRST (before checking current token)
     // This ensures we don't skip turnEnd just because the current combatant has no token
