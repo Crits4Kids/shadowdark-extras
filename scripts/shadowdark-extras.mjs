@@ -41,7 +41,7 @@ import { initCarousing, injectCarousingButton, ensureCarousingJournal, ensureCar
 import { openCarousingOverlay, refreshCarousingOverlay } from "./CarousingOverlaySD.mjs";
 import { openCarousingTablesEditor } from "./CarousingTablesApp.mjs";
 import { openExpandedCarousingTablesEditor } from "./ExpandedCarousingTablesApp.mjs";
-import { initTemplateEffects, processTemplateTurnEffects, setupTemplateEffectFlags } from "./TemplateEffectsSD.mjs";
+import { initTemplateEffects, processTemplateTurnEffects, setupTemplateEffectFlags, getTemplateRegion } from "./TemplateEffectsSD.mjs";
 import { initAuraEffects, createAuraOnActor, getActiveAuras, getTokensInAura } from "./AuraEffectsSD.mjs";
 import { registerDisplayNpcEnricher } from "./DisplayNpc.mjs";
 import { registerDisplayTableEnricher } from "./DisplayTable.mjs";
@@ -2672,7 +2672,7 @@ const npcActiveTabTracker = new Map();
 /**
  * Enable chat icon on item images to show item in chat
  * NOTE: This only handles items that Shadowdark doesn't natively handle.
- * Shadowdark's PlayerSheetSD already has _onItemChatClick which calls displayCard()
+ * Shadowdark's PlayerSheetSD already has _onItemChatClick which calls shadowdark.chat.showItemCard()
  * for all items via .item-image click. We only need to handle NPC items.
  */
 function enableItemChatIcon(app, html) {
@@ -2704,8 +2704,8 @@ function enableItemChatIcon(app, html) {
 			return;
 		}
 
-		// Show item in chat - Shadowdark uses displayCard()
-		await item.displayCard();
+		// Show item in chat - SD 4.x removed ItemSD.displayCard in favor of ChatSD.showItemCard
+		await shadowdark.chat.showItemCard(item.uuid);
 	});
 }
 
@@ -7985,9 +7985,10 @@ function registerNPCAttackSheet() {
  * Register the AppV2 NPC Feature item sheet
  */
 function registerNPCFeatureSheet() {
-	// Register the NPC Feature sheet for NPC Feature and NPC Spell type items
+	// Register the NPC Feature sheet. SD 4.x migrated "NPC Spell" items to "Spell"
+	// (Update_251001_1), so registering for that sub-type only logs a warning.
 	foundry.documents.collections.Items.registerSheet(MODULE_ID, NPCFeatureSheetSD, {
-		types: ["NPC Feature", "NPC Spell"],
+		types: ["NPC Feature"],
 		makeDefault: true,
 		label: "Shadowdark Extras: NPC Feature/Spell Sheet"
 	});
@@ -8855,6 +8856,10 @@ function patchPlayerSheetUseAbility() {
 
 	// Only patch if getSkipPrompt is missing (i.e. the bug exists in this system version)
 	if (typeof PlayerSheetSD.prototype.getSkipPrompt === "function") return;
+
+	// SD 4.x moved useAbility onto the Player data model and its own _onUseAbility
+	// already handles skipPrompt. Overriding it would call the removed actor.useAbility.
+	if (typeof CONFIG.Actor.dataModels?.Player?.prototype?.useAbility === "function") return;
 
 	PlayerSheetSD.prototype._onUseAbility = async function (event) {
 		event.preventDefault();
@@ -18244,37 +18249,42 @@ async function processNPCFeatureItemGive(item, actor, token, targetToken, target
 	}
 }
 
-// Patch ItemSD.displayCard to execute macros and activities for NPC Features
+// Patch shadowdark.chat.showItemCard to execute macros and activities for NPC Features.
+// SD 4.x removed ItemSD.displayCard; the NPC sheet's display-feature action now calls
+// shadowdark.chat.showItemCard(item.uuid) (NpcSheetSD#_displayFeature).
 Hooks.once("ready", () => {
 	// Wait a short time to ensure the system is fully loaded
 	setTimeout(() => {
-		const itemDocClass = CONFIG.Item.documentClass;
-		if (!itemDocClass?.prototype?.displayCard) {
-			console.warn(`${MODULE_ID} | ItemSD.displayCard not found, cannot patch NPC Feature macro execution`);
+		const chat = globalThis.shadowdark?.chat;
+		if (typeof chat?.showItemCard !== "function") {
+			console.warn(`${MODULE_ID} | shadowdark.chat.showItemCard not found, cannot patch NPC Feature macro execution`);
 			return;
 		}
 
-		const originalDisplayCard = itemDocClass.prototype.displayCard;
+		const originalShowItemCard = chat.showItemCard;
 
-		itemDocClass.prototype.displayCard = async function (options = {}) {
+		chat.showItemCard = async function (uuid, ...args) {
 			// Call original method first
-			await originalDisplayCard.call(this, options);
+			const result = await originalShowItemCard.call(this, uuid, ...args);
 
-			// Only process NPC Features and NPC Spells
-			if (this.type !== "NPC Feature" && this.type !== "NPC Spell") return;
+			// showItemCard is shared by every item type; only process NPC Features
+			const item = await fromUuid(uuid);
+			if (item?.type !== "NPC Feature" || !item.actor) return result;
 
 			// Get token for context
 			const selectedTokens = canvas.tokens?.controlled || [];
-			const token = selectedTokens.find(t => t.actor?.id === this.actor?.id) || null;
+			const token = selectedTokens.find(t => t.actor?.id === item.actor.id) || null;
 
 			// Execute the macro first
-			await executeNPCFeatureItemMacro(this, this.actor, {});
+			await executeNPCFeatureItemMacro(item, item.actor, {});
 
 			// Then process activities
-			await processNPCFeatureActivities(this, this.actor, token);
+			await processNPCFeatureActivities(item, item.actor, token);
+
+			return result;
 		};
 
-		console.log(`${MODULE_ID} | Patched ItemSD.displayCard for NPC Feature macro and activity execution`);
+		console.log(`${MODULE_ID} | Patched shadowdark.chat.showItemCard for NPC Feature macro and activity execution`);
 
 	}, 100);
 });
@@ -18437,62 +18447,67 @@ Hooks.once("ready", () => {
 	}
 });
 
-// Patch ActorSD.useAbility to execute Class Ability item macros
+// Patch the Player data model's useAbility to execute Class Ability item macros.
+// SD 4.x moved useAbility(abilityUuid, config) from ActorSD onto the Player model
+// (models/PlayerSD.mjs); it is reached as actor.system.useAbility(...).
 Hooks.once("ready", () => {
 	setTimeout(() => {
-		const actorDocClass = CONFIG.Actor.documentClass;
-		if (!actorDocClass?.prototype?.useAbility) {
-			console.warn(`${MODULE_ID} | ActorSD.useAbility not found, cannot patch Class Ability macro execution`);
+		const PlayerModel = CONFIG.Actor.dataModels?.Player;
+		if (typeof PlayerModel?.prototype?.useAbility !== "function") {
+			console.warn(`${MODULE_ID} | PlayerSD.useAbility not found, cannot patch Class Ability macro execution`);
 			return;
 		}
 
-		const originalUseAbility = actorDocClass.prototype.useAbility;
+		const originalUseAbility = PlayerModel.prototype.useAbility;
 
-		actorDocClass.prototype.useAbility = async function (itemId, options = {}) {
-			const item = this.items.get(itemId);
+		PlayerModel.prototype.useAbility = async function (abilityUuid, config = {}) {
+			const actor = this.parent;
+			const item = await fromUuid(abilityUuid);
 
 			// Only intercept Class Ability items
 			if (!item || item.type !== "Class Ability") {
-				return originalUseAbility.call(this, itemId, options);
+				return originalUseAbility.call(this, abilityUuid, config);
 			}
 
-			// Call original method first
-			const result = await originalUseAbility.call(this, itemId, options);
+			// The system returns nothing on success and also bails out silently
+			// (closed prompt, lost ability, no uses left, a cancelling hook).
+			// Treat "this actor posted a new chat message" as the ability having been used.
+			const knownMessageIds = new Set(game.messages.keys());
 
-			// If the ability had a roll check, determine the outcome
+			// Call original method first
+			const result = await originalUseAbility.call(this, abilityUuid, config);
+
+			const newMessages = game.messages.contents.filter(msg =>
+				!knownMessageIds.has(msg.id) && msg.speaker?.actor === actor.id
+			);
+			if (!newMessages.length) return result;
+
+			// If the ability had a roll check, determine the outcome from the posted roll
 			let rolled = false;
 			let success = true;
 			let critical = null;
 
-			if (item.system.ability) {
-				rolled = true;
-				// Re-derive success from the same logic the system uses:
-				// useAbility calls rollAbility which returns { rolls: { main: { success, critical } } }
-				// But the result from useAbility is the chat message, not the roll result.
-				// We need to check the most recent chat message for this actor's roll result.
-				const recentMessages = game.messages.contents.slice(-5);
-				for (let i = recentMessages.length - 1; i >= 0; i--) {
-					const msg = recentMessages[i];
-					const rollData = readSdRollOutcome(msg);
-					if (rollData.mainRoll && !rollData.isMasked && msg.speaker?.actor === this.id) {
-						success = rollData.isSuccess;
-						critical = rollData.isCriticalSuccess
-							? "success"
-							: rollData.isCriticalFailure
-								? "failure"
-								: null;
-						break;
-					}
+			for (let i = newMessages.length - 1; i >= 0; i--) {
+				const rollData = readSdRollOutcome(newMessages[i]);
+				if (rollData.mainRoll && !rollData.isMasked) {
+					rolled = true;
+					success = rollData.isSuccess;
+					critical = rollData.isCriticalSuccess
+						? "success"
+						: rollData.isCriticalFailure
+							? "failure"
+							: null;
+					break;
 				}
 			}
 
 			// Execute the macro
-			await executeClassAbilityItemMacro(item, this, { rolled, success, critical });
+			await executeClassAbilityItemMacro(item, actor, { rolled, success, critical });
 
 			return result;
 		};
 
-		console.log(`${MODULE_ID} | Patched ActorSD.useAbility for Class Ability macro execution`);
+		console.log(`${MODULE_ID} | Patched PlayerSD.useAbility for Class Ability macro execution`);
 	}, 100);
 });
 
@@ -18748,12 +18763,21 @@ SDX.templates = {
 			// Create the template object for preview
 			const template = new CONFIG.MeasuredTemplate.objectClass(doc);
 
+			// v14: existing templates are Region placeables, which are interactive and swallow the
+			// pointerdown before it reaches our canvas.stage listener (the click selects that Region
+			// and placement never completes). Suspend Region interaction until cleanup().
+			// TemplateLayer#activate() re-activates the RegionLayer, which turns interactiveChildren
+			// back on, so this is re-applied after activation below.
+			const regionLayer = canvas.regions;
+			if (regionLayer) regionLayer.interactiveChildren = false;
+
 			// Add to preview layer, then await draw before activating layer / refreshing
 			// (v14: template.draw() is async; not awaiting leaves shape=null and the preview invisible)
 			canvas.templates.preview.addChild(template);
 			template.draw().then(() => {
 				if (resolved) return;
 				if (canvas.activeLayer !== canvas.templates) canvas.templates.activate();
+				if (regionLayer) regionLayer.interactiveChildren = false;
 				template.renderFlags.set({ refresh: true });
 				updateTokenHighlighting();
 			}).catch(err => console.error(`${MODULE_ID} | template.draw() failed:`, err));
@@ -18896,6 +18920,8 @@ SDX.templates = {
 				canvas.stage.off("rightdown", onRightClick);
 				canvas.app.view.removeEventListener("wheel", onWheel);
 				document.removeEventListener("keydown", onKeyDown);
+				// Same rule core uses: an active InteractionLayer has interactive children
+				if (regionLayer) regionLayer.interactiveChildren = regionLayer.active;
 
 				// Remove and destroy elevation text
 				if (elevationText && elevationText.parent) {
@@ -19124,6 +19150,22 @@ SDX.templates = {
 	 * @returns {Token[]} - Array of Token objects inside the template
 	 */
 	getTokensInTemplate(templateDoc, overrideLevelId = null) {
+		// v14: test against the backing Region. The template shim's shape is wrong for rays
+		// (it reads the Region's pixel width as feet), so it over-includes tokens.
+		const region = getTemplateRegion(templateDoc);
+		if (region) {
+			const casterLevelId = overrideLevelId
+				?? region.flags?.["shadowdark-extras"]?.casterLevelId
+				?? null;
+			return canvas.tokens.placeables.filter(t => {
+				if (t.document.parent !== region.parent) return false;
+				if (casterLevelId && (t.document?.level ?? null) !== casterLevelId) return false;
+				// testInsideRegion applies the Region's levels and elevation range itself
+				return t.document.testInsideRegion(region);
+			});
+		}
+
+		// v13 fallback: MeasuredTemplate placeable shape
 		if (!templateDoc?.object) {
 			console.warn(`${MODULE_ID} | getTokensInTemplate: Template object not found`);
 			return [];

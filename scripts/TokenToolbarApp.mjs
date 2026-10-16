@@ -266,11 +266,7 @@ export class TokenToolbarApp extends HandlebarsApplicationMixin(ApplicationV2) {
                 } else if (itemType === "NPC Attack") {
                     // Check if it's a special attack which shouldn't be rolled via rollAttack
                     if (item.system.attackType === "special") {
-                        if (typeof item.displayCard === "function") {
-                            await item.displayCard();
-                        } else {
-                            item.sheet.render(true);
-                        }
+                        await shadowdark.chat.showItemCard(item.uuid);
                         return;
                     }
 
@@ -292,25 +288,17 @@ export class TokenToolbarApp extends HandlebarsApplicationMixin(ApplicationV2) {
                             options.target = options.targetToken.actor.system.attributes.ac.value;
                         }
                         await item.rollNpcAttack(parts, data, options);
-                    } else if (typeof item.displayCard === "function") {
-                        await item.displayCard();
+                    } else if (typeof shadowdark?.chat?.showItemCard === "function") {
+                        await shadowdark.chat.showItemCard(item.uuid);
                     } else {
                         item.sheet.render(true);
                     }
                 } else if (itemType === "NPC Special Attack") {
                     // NPC Special Attack - these are generally not rolled, just displayed
-                    if (typeof item.displayCard === "function") {
-                        await item.displayCard();
-                    } else {
-                        item.sheet.render(true);
-                    }
+                    await shadowdark.chat.showItemCard(item.uuid);
                 } else if (itemType === "NPC Feature") {
                     // NPC Feature - display card or open sheet
-                    if (typeof item.displayCard === "function") {
-                        await item.displayCard();
-                    } else {
-                        item.sheet.render(true);
-                    }
+                    await shadowdark.chat.showItemCard(item.uuid);
                 } else {
                     // For other items, open the item sheet
                     item.sheet.render(true);

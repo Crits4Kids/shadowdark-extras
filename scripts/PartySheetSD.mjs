@@ -1864,7 +1864,8 @@ export default class PartySheetSD extends (foundry.appv1?.sheets?.ActorSheet || 
 		event.preventDefault();
 		const itemId = event.currentTarget.closest(".item")?.dataset.itemId;
 		const item = this.actor.items.get(itemId);
-		item?.displayCard();
+		// SD 4.x removed ItemSD.displayCard; item cards go through ChatSD.showItemCard
+		if (item) shadowdark.chat.showItemCard(item.uuid);
 	}
 
 	/**

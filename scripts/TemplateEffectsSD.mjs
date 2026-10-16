@@ -11,6 +11,28 @@
 
 const MODULE_ID = "shadowdark-extras";
 
+/**
+ * Resolve the RegionDocument backing a template.
+ * In v14 a MeasuredTemplate is only a shim over a Region with the same id: template hooks never
+ * fire and post-create template writes are dropped, so the Region is the source of truth.
+ * Returns null on v13, where templates are real documents.
+ * @param {MeasuredTemplateDocument|RegionDocument} templateDoc
+ * @returns {RegionDocument|null}
+ */
+export function getTemplateRegion(templateDoc) {
+    if (!templateDoc) return null;
+    if (templateDoc.documentName === "Region") return templateDoc;
+    return templateDoc.parent?.regions?.get(templateDoc.id) ?? null;
+}
+
+/**
+ * Is this Region a spell template (core template shim or an SDX template-effects area)?
+ * @param {RegionDocument} region
+ */
+function _isTemplateRegion(region) {
+    return !!(region?.flags?.core?.MeasuredTemplate || region?.flags?.[MODULE_ID]?.templateEffects);
+}
+
 // Track previous token positions for movement detection
 const _previousTokenPositions = new Map();
 
@@ -56,23 +78,27 @@ export function initTemplateEffects() {
         await processTokenMovement(tokenDoc, changes);
     });
 
-    // Hook for template creation - store initial contained tokens AND trigger onCreation
-    Hooks.on("createMeasuredTemplate", async (templateDoc, options, userId) => {
+    // Hook for template creation - store initial contained tokens AND trigger onCreation.
+    // v14 never fires createMeasuredTemplate (the shim creates a Region), so listen on
+    // createRegion too; on v13 only the template hook fires, so nothing runs twice.
+    const _onCreateTemplate = async (templateDoc) => {
         if (!game.user.isGM) return;
 
-        // Read config BEFORE any setFlag (v14 silently drops post-create setFlag on templates)
         const config = templateDoc.flags?.[MODULE_ID]?.templateEffects;
+        const region = getTemplateRegion(templateDoc);
 
-        // Wait for the template placeable and its shape to be ready (retry up to 1s)
+        // v13 only: wait for the template placeable and its shape to be ready (retry up to 1s).
+        // Region containment is computed from document data and needs no placeable.
         let attempts = 0;
-        while (!templateDoc.object?.shape && attempts < 10) {
+        while (!region && !templateDoc.object?.shape && attempts < 10) {
             await new Promise(r => setTimeout(r, 100));
             attempts++;
         }
         const tokens = getTokensInTemplate(templateDoc);
 
         if (tokens.length > 0) {
-            await templateDoc.setFlag(MODULE_ID, 'containedTokens', tokens.map(t => t.id));
+            // Write to the Region: v14 silently drops setFlag on the template shim
+            await (region ?? templateDoc).setFlag(MODULE_ID, 'containedTokens', tokens.map(t => t.id));
         }
 
         // Trigger onCreation for tokens already inside at placement time.
@@ -80,9 +106,14 @@ export function initTemplateEffects() {
         if (config?.enabled && config.triggers?.onCreation && tokens.length > 0) {
             console.log(`shadowdark-extras | Triggering onCreation effects for new template ${config.spellName || 'template'}`);
             for (const token of tokens) {
-                await applyTemplateEffect(templateDoc, token, 'creation');
+                // Same document the movement path uses, so effect origins match on removal
+                await applyTemplateEffect(region ?? templateDoc, token, 'creation');
             }
         }
+    };
+    Hooks.on("createMeasuredTemplate", (templateDoc) => _onCreateTemplate(templateDoc));
+    Hooks.on("createRegion", (region) => {
+        if (_isTemplateRegion(region)) _onCreateTemplate(region);
     });
 
     // Hook for template/region deletion - clean up effects
@@ -91,14 +122,25 @@ export function initTemplateEffects() {
         const config = doc.flags?.[MODULE_ID]?.templateEffects;
         if (!config?.enabled) return;
         if (config.triggers?.onLeave) {
-            const containedTokenIds = doc.flags?.[MODULE_ID]?.containedTokens || [];
-            for (const tokenId of containedTokenIds) {
+            // containedTokens can miss tokens (e.g. a flag write that failed), so also sweep
+            // the scene for tokens still carrying an effect that originated from this template.
+            const tokenIds = new Set(doc.flags?.[MODULE_ID]?.containedTokens || []);
+            for (const tokenDoc of doc.parent?.tokens ?? []) {
+                const hasEffect = tokenDoc.actor?.items?.some(i =>
+                    i.type === "Effect" && i.getFlag(MODULE_ID, "templateOrigin") === doc.id
+                );
+                if (hasEffect) tokenIds.add(tokenDoc.id);
+            }
+            for (const tokenId of tokenIds) {
                 const token = canvas.tokens?.get(tokenId);
                 if (token) await removeTemplateEffects(doc, token);
             }
         }
     };
     Hooks.on("deleteMeasuredTemplate", (doc) => _onDeleteTemplate(doc));
+    Hooks.on("deleteRegion", (region) => {
+        if (_isTemplateRegion(region)) _onDeleteTemplate(region);
+    });
 
     // Clear per-turn tracking and process turn-based effects when combat advances
     Hooks.on("updateCombat", async (combat, changes, options, userId) => {
@@ -1364,14 +1406,24 @@ function ensureTemplateShape(template) {
  * @returns {Token[]} Array of tokens inside the template
  */
 export function getTokensInTemplate(templateDoc) {
-    // In v14 a MeasuredTemplate auto-creates a Region with the EXACT SAME document ID.
-    // The Region carries the levels field; use it for the level check when available.
-    let levelDoc = templateDoc;
-    if (!(templateDoc.levels instanceof Set) && templateDoc.parent) {
-        const region = templateDoc.parent.regions?.get(templateDoc.id);
-        if (region) levelDoc = region;
+    // v14: test against the backing Region. TokenDocument#testInsideRegion is the same check core
+    // uses to fill RegionDocument#tokens, but that set is filled asynchronously after creation, so
+    // it is still empty when createRegion fires. The template shim's own shape is also wrong for
+    // rays (it reads the Region's pixel width as feet), so never test against the shim.
+    const region = getTemplateRegion(templateDoc);
+    if (region) {
+        const tokens = [];
+        for (const tokenDoc of region.parent.tokens) {
+            const token = tokenDoc.object;
+            if (!token) continue;
+            if (!_isSameLevel(tokenDoc.level ?? null, region)) continue;
+            if (tokenDoc.testInsideRegion(region)) tokens.push(token);
+        }
+        return tokens;
     }
 
+    // v13 fallback: MeasuredTemplate placeable shape
+    const levelDoc = templateDoc;
     const template = templateDoc.object;
     if (!ensureTemplateShape(template)) return [];
 
