@@ -7,7 +7,7 @@ import { getWeaponBonuses, getWeaponEffectsToApply, evaluateRequirements, calcul
 import { startDurationSpell, linkEffectToDurationSpell, linkEffectToFocusSpell, linkTargetToFocusSpell, startFocusSpellIfNeeded, getActiveDurationSpells, endFocusSpell } from "./FocusSpellTrackerSD.mjs";
 import { setupTemplateEffectFlags, buildTemplateEffectsFlag, applyTemplateEffect, getTokensInTemplate } from "./TemplateEffectsSD.mjs";
 import { createAuraOnActor } from "./AuraEffectsSD.mjs";
-import { readSdRollOutcome, readSdDamageRoll, resolveCardContext } from "./sd4Compat.mjs";
+import { readSdRollOutcome, readSdDamageRoll, resolveCardContext, applyLegacyEffectDuration } from "./sd4Compat.mjs";
 import { getEffectiveCreatureType } from "./CreatureTypesApp.mjs";
 
 const MODULE_ID = "shadowdark-extras";
@@ -622,13 +622,9 @@ export function setupCombatSocket() {
 
 			// Apply duration overrides to embedded effects if provided
 			if (data.duration && Object.keys(data.duration).length > 0 && effectData.effects) {
-				effectData.effects = effectData.effects.map(effect => {
-					// SD 4.x / Foundry v14: effect.duration may expose getter-only fields
-					// (e.g. `rounds`), so Object.assign onto it throws. Spread into a fresh
-					// plain object instead — reads via getter are fine, writes go to a new obj.
-					effect.duration = { ...(effect.duration ?? {}), ...data.duration };
-					return effect;
-				});
+				// data.duration is the legacy editor shape ({rounds, turns, seconds, start*});
+				// v14 needs it converted to duration.{value, units, expiry} + start.*
+				effectData.effects = effectData.effects.map(effect => applyLegacyEffectDuration(effect, data.duration));
 			}
 
 			// Also apply duration to the item's system.duration if it exists

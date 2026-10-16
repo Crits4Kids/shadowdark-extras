@@ -199,3 +199,59 @@ export function getActorStats(actor) {
 		ac: sys.ac?.value ?? null
 	};
 }
+
+/**
+ * Apply an SDX duration override (the legacy shape stored by the effect duration
+ * editors: `{seconds, rounds, turns, startTime, startRound, startTurn}`) to an
+ * ActiveEffect source object, in place.
+ *
+ * Foundry v14 replaced `duration.{rounds,turns,seconds}` with
+ * `duration.{value, units, expiry}` and moved the start fields to `start.*`.
+ * Core only migrates `duration.rounds` when `duration.value` is absent, so merging
+ * the legacy keys into an already-migrated duration silently loses them.
+ *
+ * @param {object} effect   ActiveEffect source data (e.g. from Item#toObject().effects)
+ * @param {object} override Legacy duration override; empty strings mean "not set"
+ * @returns {object} The same effect object
+ */
+export function applyLegacyEffectDuration(effect, override = {}) {
+	// v13: the legacy fields are still the schema
+	if ((game.release?.generation ?? 0) < 14) {
+		effect.duration = { ...(effect.duration ?? {}), ...override };
+		return effect;
+	}
+
+	const num = v => (v === "" || v == null || !Number.isFinite(Number(v))) ? null : Number(v);
+
+	const duration = { ...(effect.duration ?? {}) };
+	for (const units of ["rounds", "turns", "seconds"]) {
+		const value = num(override[units]);
+		if (value === null) continue;
+		duration.value = value;
+		duration.units = units;
+		// Same default core gives a migrated numeric duration
+		duration.expiry ??= "turnStart";
+		break;
+	}
+	effect.duration = duration;
+
+	// start is null on unowned source data; when set, its schema requires every field (incl. time)
+	const start = {
+		time: game.time.worldTime, combat: null, combatant: null, initiative: null, round: null, turn: null,
+		...(effect.start ?? {})
+	};
+	let hasStart = false;
+	for (const [legacyKey, key] of [["startRound", "round"], ["startTurn", "turn"], ["startTime", "time"]]) {
+		const value = num(override[legacyKey]);
+		if (value === null) continue;
+		start[key] = value;
+		hasStart = true;
+	}
+	if (override.combat) {
+		start.combat = override.combat;
+		hasStart = true;
+	}
+	if (hasStart) effect.start = start;
+
+	return effect;
+}

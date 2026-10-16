@@ -289,7 +289,8 @@ async function startFocusSpell(actor, spell, perTurnConfig = null) {
 		},
 		effects: [{
 			name: concentrationName,
-			icon: concentrationIcon,
+			// ActiveEffect#icon was renamed to img in v12; the shim is gone in v14
+			img: concentrationIcon,
 			origin: spell.uuid,
 			transfer: true,
 			statuses: ["concentration"],

@@ -92,6 +92,29 @@ export default class PlaceableNotesSD extends foundry.applications.api.Handlebar
         buttons.unshift(noteButton);
     }
 
+    /**
+     * Add the SDX Notes entry to an AppV2 sheet's header controls (the ⋮ menu).
+     * Placeable config sheets are AppV2 since v13, so the AppV1 get*HeaderButtons hooks never fire.
+     * The menu is rebuilt on every open, so the icon always reflects the saved state.
+     * @param {foundry.applications.api.ApplicationV2} app
+     * @param {ApplicationHeaderControlsEntry[]} controls
+     */
+    static addHeaderControl(app, controls) {
+        if (!game.user.isGM) return;
+
+        const object = app.document;
+        const supportedTypes = ["AmbientLight", "AmbientSound", "Token", "Wall", "Tile"];
+        if (!supportedTypes.includes(object?.documentName)) return;
+
+        const hasNotes = !!object.getFlag(MODULE_ID, "notes");
+        controls.unshift({
+            action: "open-sdx-notes",
+            label: "SDX Notes",
+            icon: hasNotes ? "fas fa-sticky-note" : "far fa-sticky-note",
+            onClick: () => new PlaceableNotesSD(object).render(true)
+        });
+    }
+
     static _updateHeaderButton(app, html) {
         if (!game.user.isGM) return;
 
@@ -144,19 +167,14 @@ export { PlaceableNotesSD };
 export function initPlaceableNotes() {
     if (!game.settings.get(MODULE_ID, "enablePlaceableNotes")) return;
 
-    // Hook into both V1 and V2 application header generation
-    Hooks.on("getAmbientLightConfigHeaderButtons", PlaceableNotesSD.addHeaderButton);
-    Hooks.on("getAmbientSoundConfigHeaderButtons", PlaceableNotesSD.addHeaderButton);
-    Hooks.on("getTokenConfigHeaderButtons", PlaceableNotesSD.addHeaderButton);
-    Hooks.on("getWallConfigHeaderButtons", PlaceableNotesSD.addHeaderButton);
-    Hooks.on("getTileConfigHeaderButtons", PlaceableNotesSD.addHeaderButton);
-    Hooks.on("getActorSheetHeaderButtons", PlaceableNotesSD.addHeaderButton);
+    // Placeable config sheets are AppV2 (v13+): add to their header controls menu
+    Hooks.on("getHeaderControlsAmbientLightConfig", PlaceableNotesSD.addHeaderControl);
+    Hooks.on("getHeaderControlsAmbientSoundConfig", PlaceableNotesSD.addHeaderControl);
+    Hooks.on("getHeaderControlsTokenConfig", PlaceableNotesSD.addHeaderControl);
+    Hooks.on("getHeaderControlsWallConfig", PlaceableNotesSD.addHeaderControl);
+    Hooks.on("getHeaderControlsTileConfig", PlaceableNotesSD.addHeaderControl);
 
-    // Update buttons after render to reflect saved state
-    Hooks.on("renderAmbientLightConfig", PlaceableNotesSD._updateHeaderButton);
-    Hooks.on("renderAmbientSoundConfig", PlaceableNotesSD._updateHeaderButton);
-    Hooks.on("renderTokenConfig", PlaceableNotesSD._updateHeaderButton);
-    Hooks.on("renderWallConfig", PlaceableNotesSD._updateHeaderButton);
-    Hooks.on("renderTileConfig", PlaceableNotesSD._updateHeaderButton);
+    // Shadowdark actor sheets are still AppV1
+    Hooks.on("getActorSheetHeaderButtons", PlaceableNotesSD.addHeaderButton);
     Hooks.on("renderActorSheet", PlaceableNotesSD._updateHeaderButton);
 }
